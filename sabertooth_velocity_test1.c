@@ -148,13 +148,6 @@ void read_encoders_and_compute_wheel_velocities(float *left_wheel_velocity, floa
     prev_time_us = curr_time_us;
 }
 
-// Function to compute linear and angular velocities of the robot based on wheel velocities
-void compute_robot_velocities(float left_wheel_velocity, float right_wheel_velocity, float *linear_velocity, float *angular_velocity) {
-    // Compute linear and angular velocities based on wheel velocities
-    *linear_velocity = (left_wheel_velocity + right_wheel_velocity) / 2.0;
-    *angular_velocity = (right_wheel_velocity - left_wheel_velocity) / wheel_base_distance;
-}
-
 //quick convert so we can just throw ints into motors:
 void sendMotor(int input){
     uart_putc_raw(uart1, (uint8_t)input);
@@ -260,6 +253,9 @@ void cmd_vel_callback(const void *msgin) {
 
     //for safety cutoff store the current time (uS since boot):
     last_cmd_received_time = time_us_64();
+
+    //bit of feedback to show data is passing:
+    gpio_put(LED_PIN, !gpio_get(LED_PIN));
 }
 
 //processes the distance travelled into odometry feedback to ROS:
@@ -478,9 +474,6 @@ int main() {
 
         //closed loop speed control and safety cut-off:
         motor_speed_control();
-
-        //calculate the odometry feedback and pubish to ros /odom topic
-        //odom_calc_send(&support);
 
         //the "everything is ok" flasher:
         flasher();
