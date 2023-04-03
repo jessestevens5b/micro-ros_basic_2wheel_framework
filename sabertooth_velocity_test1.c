@@ -31,21 +31,17 @@ const uint LED_PIN = 25;
 
 // WHEELS AND ENCODERS:
 const uint encoder_resolution = 4096; //ticks per revolution (check)
-//int32_t last_left_encoder_count = 0; //for storing previous count for comparison (for calculated wheel rotation)
-//int32_t last_right_encoder_count = 0; //for storing previous count for comparison (for calculated wheel rotation)
 volatile int32_t left_encoder_count = 0; //for storing current count
 volatile int32_t right_encoder_count = 0; //for storing current count
 const float wheel_radius = 0.025; //25mm
 const float wheel_base_distance = 0.35; //350mm spacing
-//double last_left_wheel_distance = 0.0; //for distance travelled feedback to odom
-//double last_right_wheel_distance = 0.0; //for distance travelled feedback to odom
 
 //PID closed loop speed control:
 float prev_left_error = 0;
 float prev_right_error = 0;
 int64_t last_pid_run = 0;
 int64_t last_odom_calc = 0;
-int64_t odom_read_space = 100 * 1000; //needed now?
+int64_t odom_read_space = 100 * 1000; //needed now? REMOVE
 
 //motor cutoff (when lost contact from ROS:
 int64_t last_cmd_received_time = 0;
@@ -55,46 +51,120 @@ float right_wheel_velocity = 0;
 float target_left_wheel_velocity = 0;
 float target_right_wheel_velocity = 0;
 
+// Robot position and orientation
+double robot_x = 0.0;
+double robot_y = 0.0;
+double robot_theta = 0.0;
+
+//encoder input pins:
+const int LEncoderA = 6;
+const int LEncoderB = 7;
+const int REncoderA = 8;
+const int REncoderB = 9;
+
 
 //our actual pubs and subs:
 rcl_publisher_t odom; //not yet used until we start publishing
-rcl_subscription_t cmd_vel_sub;
+rcl_subscription_t cmd_vel_sub; //to subscribe to velocity topic
+rcl_subscription_t updated_odom_sub; //to subscribe for updated odometry from sensor fusion
+
 rclc_support_t support;
 
 //odometry
 nav_msgs__msg__Odometry odom_msg;
+nav_msgs__msg__Odometry updated_odom;
 
 //our cmd_vel message store:
 geometry_msgs__msg__Twist cmd_vel;
 
-
-void left_encoder_isr() {
-    static uint8_t old_a_state = 0;
-    uint8_t a_state = gpio_get(6);
-    uint8_t b_state = gpio_get(7);
+void left_encoder_process() {
+    static const int8_t left_encoder_direction = 1;
+    volatile static uint8_t old_a_state = 0;
+    uint8_t a_state = gpio_get(LEncoderA);
 
     if (a_state != old_a_state) {
         old_a_state = a_state;
-        if (a_state != b_state) {
-            left_encoder_count++;
+        if (a_state == 1) {
+            if (left_encoder_direction == 1) {
+                if (gpio_get(LEncoderB) == 0) {
+                    left_encoder_count++;
+                } else {
+                    left_encoder_count--;
+                }
+            } else {
+                if (gpio_get(LEncoderB) == 1) {
+                    left_encoder_count++;
+                } else {
+                    left_encoder_count--;
+                }
+            }
         } else {
-            left_encoder_count--;
+            if (left_encoder_direction == 1) {
+                if (gpio_get(LEncoderB) == 1) {
+                    left_encoder_count++;
+                } else {
+                    left_encoder_count--;
+                }
+            } else {
+                if (gpio_get(LEncoderB) == 0) {
+                    left_encoder_count++;
+                } else {
+                    left_encoder_count--;
+                }
+            }
         }
     }
 }
 
-void right_encoder_isr() {
-    static uint8_t old_a_state = 0;
-    uint8_t a_state = gpio_get(8);
-    uint8_t b_state = gpio_get(9);
+void right_encoder_process() {
+    static const int8_t right_encoder_direction = 1;
+    volatile static uint8_t old_a_state = 0;
+    uint8_t a_state = gpio_get(REncoderA);
 
     if (a_state != old_a_state) {
         old_a_state = a_state;
-        if (a_state != b_state) {
-            right_encoder_count++;
+        if (a_state == 1) {
+            if (right_encoder_direction == 1) {
+                if (gpio_get(REncoderB) == 0) {
+                    right_encoder_count++;
+                } else {
+                    right_encoder_count--;
+                }
+            } else {
+                if (gpio_get(REncoderB) == 1) {
+                    right_encoder_count++;
+                } else {
+                    right_encoder_count--;
+                }
+            }
         } else {
-            right_encoder_count--;
+            if (right_encoder_direction == 1) {
+                if (gpio_get(REncoderB) == 1) {
+                    right_encoder_count++;
+                } else {
+                    right_encoder_count--;
+                }
+            } else {
+                if (gpio_get(REncoderB) == 0) {
+                    right_encoder_count++;
+                } else {
+                    right_encoder_count--;
+                }
+            }
         }
+    }
+}
+
+//for some reason we can only have one interrupt callback, so we have to process on interrupt which gpio triggered it:
+void encoder_isr( uint gpio, uint32_t events){
+
+    switch (gpio){
+        case LEncoderA:
+            left_encoder_process();
+            return;
+        case REncoderA:
+            right_encoder_process();
+            return;
     }
 }
 
@@ -258,6 +328,50 @@ void cmd_vel_callback(const void *msgin) {
     gpio_put(LED_PIN, !gpio_get(LED_PIN));
 }
 
+void quaternion_to_euler(const geometry_msgs__msg__Quaternion *q, double *roll, double *pitch, double *yaw) {
+    double sinr_cosp = 2 * (q->w * q->x + q->y * q->z);
+    double cosr_cosp = 1 - 2 * (q->x * q->x + q->y * q->y);
+    *roll = atan2(sinr_cosp, cosr_cosp);
+
+    double sinp = 2 * (q->w * q->y - q->z * q->x);
+    if (fabs(sinp) >= 1)
+        *pitch = copysign(M_PI / 2, sinp);
+    else
+        *pitch = asin(sinp);
+
+    double siny_cosp = 2 * (q->w * q->z + q->x * q->y);
+    double cosy_cosp = 1 - 2 * (q->y * q->y + q->z * q->z);
+    *yaw = atan2(siny_cosp, cosy_cosp);
+}
+
+void updated_odom_callback(const void *msgin) {
+    const nav_msgs__msg__Odometry *msg = (const nav_msgs__msg__Odometry *)msgin;
+
+    // Update the robot's position and orientation based on the received odometry data
+    robot_x = msg->pose.pose.position.x;
+    robot_y = msg->pose.pose.position.y;
+
+    double roll, pitch, yaw;
+    quaternion_to_euler(&msg->pose.pose.orientation, &roll, &pitch, &yaw);
+    robot_theta = yaw;
+
+    // We won't update velocities as this is calculated from encoders and really shouldn't be messed with
+}
+
+void quaternion_from_yaw(double yaw, geometry_msgs__msg__Quaternion *quaternion) {
+    // Compute the quaternion values from the yaw (theta) angle
+    double half_yaw = yaw * 0.5;
+    double c_yaw = cos(half_yaw);
+    double s_yaw = sin(half_yaw);
+
+    // Assign the quaternion components
+    quaternion->x = 0.0;
+    quaternion->y = 0.0;
+    quaternion->z = s_yaw;
+    quaternion->w = c_yaw;
+}
+
+
 //processes the distance travelled into odometry feedback to ROS:
 void odom_calc_send(const rclc_support_t *support){
 
@@ -269,7 +383,7 @@ void odom_calc_send(const rclc_support_t *support){
     // Initialize variables for wheel velocities, robot velocities, and pose
     static float left_wheel_velocity, right_wheel_velocity;
     static float linear_velocity, angular_velocity;
-    static double x = 0, y = 0, theta = 0; // Position and orientation of the robot in the odometry frame
+    //static double x = 0, y = 0, theta = 0; // Position and orientation of the robot in the odometry frame
 
     // Get the current encoder counts and time
     int32_t curr_left_encoder_count = left_encoder_count;
@@ -313,9 +427,9 @@ void odom_calc_send(const rclc_support_t *support){
     double delta_distance = (delta_right_wheel_distance + delta_left_wheel_distance) / 2.0;
     double delta_theta = (delta_right_wheel_distance - delta_left_wheel_distance) / wheel_base_distance;
 
-    x += delta_distance * cos(theta + delta_theta / 2.0);
-    y += delta_distance * sin(theta + delta_theta / 2.0);
-    theta += delta_theta;
+    robot_x += delta_distance * cos(robot_theta + delta_theta / 2.0);
+    robot_y += delta_distance * sin(robot_theta + delta_theta / 2.0);
+    robot_theta += delta_theta;
 
     // Calculate linear and angular velocities
     linear_velocity = delta_distance / delta_time;
@@ -339,10 +453,10 @@ void odom_calc_send(const rclc_support_t *support){
 
 
     //nav_msgs__msg__Odometry odom_msg;
-    odom_msg.pose.pose.position.x = x;
-    odom_msg.pose.pose.position.y = y;
+    odom_msg.pose.pose.position.x = robot_x;
+    odom_msg.pose.pose.position.y = robot_y;
     odom_msg.pose.pose.position.z = 0.0;
-    //quaternion_from_yaw(theta, &odom_msg.pose.pose.orientation);
+    quaternion_from_yaw(robot_theta, &odom_msg.pose.pose.orientation);
     odom_msg.twist.twist.linear.x = linear_velocity;
     odom_msg.twist.twist.linear.y = 0.0;
     odom_msg.twist.twist.linear.z = 0.0;
@@ -369,7 +483,7 @@ void flasher(){
 }
 
 int main() {
-    //stdio_init_all(); //we don't want feedback right now
+    //stdio_init_all(); //we don't want feedback right now via serial
 
     rmw_uros_set_custom_transport(
             true,
@@ -381,21 +495,21 @@ int main() {
     );
 
     // Initialize GPIO pins for encoders
-    gpio_init(6);
-    gpio_init(7);
-    gpio_init(8);
-    gpio_init(9);
+    gpio_init(LEncoderA);
+    gpio_init(LEncoderB);
+    gpio_init(REncoderA);
+    gpio_init(REncoderB);
 
     // Initialize GPIO pins for encoders
-    gpio_set_dir(6, GPIO_IN);
-    gpio_set_dir(7, GPIO_IN);
-    gpio_set_dir(8, GPIO_IN);
-    gpio_set_dir(9, GPIO_IN);
+    gpio_set_dir(LEncoderA, GPIO_IN);
+    gpio_set_dir(LEncoderB, GPIO_IN);
+    gpio_set_dir(REncoderA, GPIO_IN);
+    gpio_set_dir(REncoderB, GPIO_IN);
 
     // Set up interrupts for encoders
-    gpio_set_irq_enabled_with_callback(6, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &left_encoder_isr);
-    gpio_set_irq_enabled_with_callback(8, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &right_encoder_isr);
-
+    gpio_set_irq_enabled_with_callback(LEncoderA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &encoder_isr);
+    //gpio_set_irq_enabled_with_callback(REncoderA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &right_encoder_isr); //cannot declare more than one callback?
+    gpio_set_irq_enabled(REncoderA, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true); //seems this works?
 
     //LED indicator on board:
     gpio_init(LED_PIN);
@@ -435,12 +549,20 @@ int main() {
             ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
             "cmd_vel");
 
+    //create our subscription to /updated_odom:
+    rclc_subscription_init_best_effort(
+            &updated_odom_sub,
+            &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+            "updated_odom"
+            );
+
     //create our publisher to /odom
     rclc_publisher_init_default(
             &odom,
             &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-            "odom"
+            "odom_raw"
             );
 
     // create timer,
@@ -458,13 +580,23 @@ int main() {
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(rcl_wait_timeout));
     rclc_executor_add_timer(&executor, &timer);
 
-    //add the subscription to the executor:
+    //add the cmd_vel subscription to the executor:
     rclc_executor_add_subscription(
             &executor,
             &cmd_vel_sub,
             &cmd_vel,
             &cmd_vel_callback,
-            ON_NEW_DATA);
+            ON_NEW_DATA
+            );
+
+    //add the updated_odom subscription to the executor:
+    rclc_executor_add_subscription(
+            &executor,
+            &updated_odom_sub,
+            &updated_odom,
+            &updated_odom_callback,
+            ON_NEW_DATA
+            );
 
     //turn the indicator LED on so we know we're awake:
     gpio_put(LED_PIN, 1);
