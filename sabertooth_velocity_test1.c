@@ -30,7 +30,7 @@ const uint LED_PIN = 25;
 #define MS_TO_NS(ms) ((ms) * 1000000ULL)
 
 // WHEELS AND ENCODERS:
-const uint encoder_resolution = 4096; //ticks per revolution (check)
+const uint encoder_resolution = 500; //ticks per revolution (check)
 volatile int32_t left_encoder_count = 0; //for storing current count
 volatile int32_t right_encoder_count = 0; //for storing current count
 const float wheel_radius = 0.025; //25mm
@@ -41,17 +41,14 @@ float prev_left_error = 0;
 float prev_right_error = 0;
 int64_t last_pid_run = 0;
 int64_t last_odom_calc = 0;
-int64_t odom_read_space = 100 * 1000; //needed now? REMOVE
 
-//motor cutoff (when lost contact from ROS:
-int64_t last_cmd_received_time = 0;
+//motor cutoff (when lost contact from ROS):
+static int64_t last_cmd_received_time = 0;
 
-float left_wheel_velocity = 0;
-float right_wheel_velocity = 0;
 float target_left_wheel_velocity = 0;
 float target_right_wheel_velocity = 0;
 
-// Robot position and orientation
+// Robot position and orientation (global)
 double robot_x = 0.0;
 double robot_y = 0.0;
 double robot_theta = 0.0;
@@ -64,13 +61,13 @@ const int REncoderB = 9;
 
 
 //our actual pubs and subs:
-rcl_publisher_t odom; //not yet used until we start publishing
+rcl_publisher_t odom; //odometry publishing
 rcl_subscription_t cmd_vel_sub; //to subscribe to velocity topic
-rcl_subscription_t updated_odom_sub; //to subscribe for updated odometry from sensor fusion
+rcl_subscription_t updated_odom_sub; //to subscribe for updated odometry from sensor fusion in ROS2
 
-rclc_support_t support;
+rclc_support_t support; //what is this? Still seems needed though
 
-//odometry
+//odometry message types
 nav_msgs__msg__Odometry odom_msg;
 nav_msgs__msg__Odometry updated_odom;
 
@@ -117,7 +114,7 @@ void left_encoder_process() {
 }
 
 void right_encoder_process() {
-    static const int8_t right_encoder_direction = 1;
+    static const int8_t right_encoder_direction = 0;
     volatile static uint8_t old_a_state = 0;
     uint8_t a_state = gpio_get(REncoderA);
 
@@ -238,23 +235,34 @@ void motor_speed_control(){
 
     //motor driver send frequency limiting and storage of speed:
     static int64_t last_motor_send = 0;
-    static int64_t motor_send_space = 100 * 1000;
+    static int64_t motor_send_space = 150 * 1000; //100ms in microseconds
 
     // Check for inactivity and stop motors if necessary
-    if (time_us_64() - last_cmd_received_time > safety_timeout_us) {
+    //if (time_us_64() - last_cmd_received_time > safety_timeout_us) {
+    if(last_motor_send == 24){ //some bullshit to keep the if happy
+        /*
         stop_motors();
         last_cmd_received_time = time_us_64(); // Update last_cmd_received_time to prevent continuous motor stop commands
+
+        //test:
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+         */
     }
     else {
         //we need to schedule our motor sending so we don't overwhelm the controller:
         if ((time_us_64() - last_motor_send) > motor_send_space) {
 
-            float elapsed_time = (time_us_64() - last_pid_run) / 1000; //in ms
-
             // Define PID controller gains
-            const float Kp = 10.0;
+            const float Kp = 20.0;
             const float Ki = 0.0;
-            const float Kd = 1.0;
+            const float Kd = 5.0;
+
+            float left_wheel_velocity = 0.0f;
+            float right_wheel_velocity = 0.0f;
+            read_encoders_and_compute_wheel_velocities(&left_wheel_velocity, &right_wheel_velocity);
+
+            //time for use in PID:
+            float elapsed_time = (time_us_64() - last_pid_run) / 1000; //convert back to ms from microseconds
 
             // Compute the error between the target velocity and the current velocity
             float left_error = target_left_wheel_velocity - left_wheel_velocity;
@@ -283,15 +291,25 @@ void motor_speed_control(){
             right_error_derivative = (right_error - prev_right_error) / elapsed_time;
 
             // Compute the control signal
-            float left_control_signal = Kp * left_error + Ki * left_error_integral + Kd * left_error_derivative;
-            float right_control_signal = Kp * right_error + Ki * right_error_integral + Kd * right_error_derivative;
+            float left_control_signal = 0.0f;
+            float right_control_signal = 0.0f;
+
+            //make sure we don't jitter when floating point problems make us not exactly zero:
+            if (target_left_wheel_velocity != 0.0f){
+                left_control_signal = Kp * left_error + Ki * left_error_integral + Kd * left_error_derivative;
+            }
+
+            if (target_right_wheel_velocity != 0.0f){
+                right_control_signal = Kp * right_error + Ki * right_error_integral + Kd * right_error_derivative;
+            }
 
             // Apply the control signal by sending it to the motor driver
             // The control signal should be converted to the appropriate format for the motor driver
             // Here, we assume that the control signal is a percentage of the maximum motor speed
             // and clamp it between -100% and 100%
-            int16_t left_motor_speed = (int16_t) (64 + 0.64 * left_control_signal);
-            int16_t right_motor_speed = (int16_t) (192 + 0.64 * right_control_signal);
+            int16_t left_motor_speed = (int16_t) (64 + (0.64 * left_control_signal));
+            int16_t right_motor_speed = (int16_t) (192 + (0.64 * right_control_signal));
+
             left_motor_speed = left_motor_speed > 127 ? 127 : left_motor_speed;
             left_motor_speed = left_motor_speed < -127 ? -127 : left_motor_speed;
             right_motor_speed = right_motor_speed > 255 ? 255 : right_motor_speed;
@@ -325,7 +343,7 @@ void cmd_vel_callback(const void *msgin) {
     last_cmd_received_time = time_us_64();
 
     //bit of feedback to show data is passing:
-    gpio_put(LED_PIN, !gpio_get(LED_PIN));
+    //gpio_put(LED_PIN, !gpio_get(LED_PIN));
 }
 
 void quaternion_to_euler(const geometry_msgs__msg__Quaternion *q, double *roll, double *pitch, double *yaw) {
