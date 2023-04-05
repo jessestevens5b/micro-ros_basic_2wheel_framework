@@ -1,19 +1,33 @@
-
-
+//By Jesse Stevens
+/*TODO: - add dynamic ability to change timing of feedback (by creating/destroying executors)
+ *      - neaten up everything into functions and probably separate files
+ *      - add rollover handling for encoder counts (not super urgent yet)
+ *      - further test closed loop speed control
+ *      - definitely understand if we really need tf to be coming from the vehicle, I think it should be
+ *          "robot_localization" package in ros to fuse data from raw inputs
+ *      - Add further abilities for LED feedback etc
+ *      - Action buttons?
+ *      - build out on circuit board for better encoder testing
+ *
+ *
+ * Currently:
+ *      - 500PPR encoders (omron)
+ *      - pull up resistors (1k) to 3.3v (encoders pull down)
+ *      - Raspberry Pi Pico
+ *      - Sabertooth Motor driver (change to VESC in time)
+ *
+ */
 //#include <stdio.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
-#include <std_msgs/msg/int32.h>
 #include <rmw_microros/rmw_microros.h>
 #include <rmw_microros/init_options.h>
-//#include <rmw_uros/options.h>
 
 #include "pico/stdlib.h"
 #include "pico_uart_transports.h"
 
-//jesse added includes:
 #include <geometry_msgs/msg/twist.h>
 #include "nav_msgs/msg/odometry.h"
 #include "hardware/uart.h"
@@ -23,7 +37,10 @@
 #include <geometry_msgs/msg/quaternion.h>
 #include "rosidl_runtime_c/string_functions.h"
 #include <string.h>
-#include "geometry_msgs/msg/transform_stamped.h"
+#include <std_msgs/msg/float64.h>
+
+//for debugging topic feedback:
+//#define DEBUG_ENABLED
 
 const uint LED_PIN = 25;
 
@@ -63,9 +80,14 @@ const int REncoderB = 9;
 
 //our actual pubs and subs:
 rcl_publisher_t odom; //odometry publishing
-rcl_publisher_t tf_pub; //transform publishing (still unclear why we need both odom and tf)
 rcl_subscription_t cmd_vel_sub; //to subscribe to velocity topic
 rcl_subscription_t updated_odom_sub; //to subscribe for updated odometry from sensor fusion in ROS2
+
+#ifdef DEBUG_ENABLED
+//DEBUG:
+rcl_publisher_t debug_publisher;
+std_msgs__msg__Float64 debug_msg;
+#endif
 
 rclc_support_t support; //what is this? Still seems needed though
 
@@ -412,22 +434,11 @@ void odomtf_calc_send(const rclc_support_t *support){
     // Calculate the elapsed time since the last call (in seconds)
     //float elapsed_time = (curr_time_us - prev_time_us) / 1000000.0f;
 
-    // Calculate the change in encoder counts for left and right wheels
+    // Calculate the change in encoder counts for left and right wheels:
     int32_t delta_left_encoder_count = curr_left_encoder_count - prev_left_encoder_count;
     int32_t delta_right_encoder_count = curr_right_encoder_count - prev_right_encoder_count;
 
-    // Handle rollover for encoder counts
-    if (delta_left_encoder_count > encoder_resolution / 2) {
-        delta_left_encoder_count -= encoder_resolution;
-    } else if (delta_left_encoder_count < -encoder_resolution / 2) {
-        delta_left_encoder_count += encoder_resolution;
-    }
-
-    if (delta_right_encoder_count > encoder_resolution / 2) {
-        delta_right_encoder_count -= encoder_resolution;
-    } else if (delta_right_encoder_count < -encoder_resolution / 2) {
-        delta_right_encoder_count += encoder_resolution;
-    }
+    // Handle rollover for encoder counts - NEED TO IMPLEMENT FOR THE 4million turn rollover on wheels
 
     // Calculate the wheel rotations (in revolutions) based on the change in encoder counts
     float left_wheel_rotations = (float) delta_left_encoder_count / encoder_resolution;
@@ -450,6 +461,9 @@ void odomtf_calc_send(const rclc_support_t *support){
     robot_x += delta_distance * cos(robot_theta + delta_theta / 2.0);
     robot_y += delta_distance * sin(robot_theta + delta_theta / 2.0);
     robot_theta += delta_theta;
+
+    //normalise the output (when wrapping past 360/0 degrees) to -pi to +pi, or 0 to 2pi:
+    robot_theta = fmod(robot_theta + 2 * M_PI, 2 * M_PI);
 
     // Calculate linear and angular velocities
     linear_velocity = delta_distance / delta_time;
@@ -487,32 +501,11 @@ void odomtf_calc_send(const rclc_support_t *support){
     // Publish the odometry message
     rcl_publish(&odom, &odom_msg, NULL);
 
-    ///////////////////////////////////////////////////////////////////////////////////
-    //now the same for the tf message:
-
-    geometry_msgs__msg__TransformStamped transform_stamped;
-
-    // Set the header of the TransformStamped message
-    transform_stamped.header.stamp.sec = (int32_t) (curr_time_us / 1000000);
-    transform_stamped.header.stamp.nanosec = (uint32_t) ((curr_time_us % 1000000) * 1000);
-    transform_stamped.header.frame_id.data = (char *) "odom";
-    transform_stamped.header.frame_id.size = strlen(transform_stamped.header.frame_id.data);
-    transform_stamped.header.frame_id.capacity = strlen(transform_stamped.header.frame_id.data) + 1;
-
-    // Set the child_frame_id of the TransformStamped message
-    transform_stamped.child_frame_id.data = (char *) "base_link";
-    transform_stamped.child_frame_id.size = strlen(transform_stamped.child_frame_id.data);
-    transform_stamped.child_frame_id.capacity = strlen(transform_stamped.child_frame_id.data) + 1;
-
-    // Set the translation and rotation (quaternion) of the TransformStamped message
-    transform_stamped.transform.translation.x = robot_x;
-    transform_stamped.transform.translation.y = robot_y;
-    transform_stamped.transform.translation.z = 0.0;
-    quaternion_from_yaw(robot_theta, &transform_stamped.transform.rotation);
-
-    // Publish the TransformStamped message
-    rcl_publish(&tf_pub, &transform_stamped, NULL);
-
+    //DEBUG DATA:
+    #ifdef DEBUG_ENABLED
+    debug_msg.data = delta_right_encoder_count;
+    rcl_publish(&debug_publisher, &debug_msg, NULL);
+    #endif
 }
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time){
@@ -594,14 +587,14 @@ int main() {
             &cmd_vel_sub,
             &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-            "cmd_vel");
+            "/cmd_vel");
 
     //create our subscription to /updated_odom:
     rclc_subscription_init_best_effort(
             &updated_odom_sub,
             &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-            "updated_odom"
+            "/updated_odom"
             );
 
     //create our publisher to /odom
@@ -609,20 +602,25 @@ int main() {
             &odom,
             &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-            "odom_raw"
+            "/odom"
             );
 
-    //create our publisher to /tf
-    rclc_publisher_init_default(
-            &tf_pub,
+    #ifdef DEBUG_ENABLED
+    //DEBUG PUBLISHER:
+    const rosidl_message_type_support_t * debug_pub_type_support = ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64);
+    rcl_publisher_options_t debug_pub_options = rcl_publisher_get_default_options();
+    rcl_publisher_init(
+            &debug_publisher,
             &node,
-            ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TransformStamped),
-            "tf"
+            debug_pub_type_support,
+            "/debug",
+            &debug_pub_options
             );
+    #endif
 
     // create timer,
     rcl_timer_t timer = rcl_get_zero_initialized_timer();
-    const unsigned int timer_timeout = 100;
+    const unsigned int timer_timeout = 50;
     rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(timer_timeout), timer_callback);
 
     //create the executor that harvests the incoming messages and shoots them off to the callback:
@@ -631,7 +629,7 @@ int main() {
     rclc_executor_init(&executor, &support.context, 2, &allocator);
 
     //timer elements for executor to publish data:
-    unsigned int rcl_wait_timeout = 20;   // in ms
+    unsigned int rcl_wait_timeout = 200;   // in ms
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(rcl_wait_timeout));
     rclc_executor_add_timer(&executor, &timer);
 
