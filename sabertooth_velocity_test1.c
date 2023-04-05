@@ -23,6 +23,7 @@
 #include <geometry_msgs/msg/quaternion.h>
 #include "rosidl_runtime_c/string_functions.h"
 #include <string.h>
+#include "geometry_msgs/msg/transform_stamped.h"
 
 const uint LED_PIN = 25;
 
@@ -62,6 +63,7 @@ const int REncoderB = 9;
 
 //our actual pubs and subs:
 rcl_publisher_t odom; //odometry publishing
+rcl_publisher_t tf_pub; //transform publishing (still unclear why we need both odom and tf)
 rcl_subscription_t cmd_vel_sub; //to subscribe to velocity topic
 rcl_subscription_t updated_odom_sub; //to subscribe for updated odometry from sensor fusion in ROS2
 
@@ -389,9 +391,8 @@ void quaternion_from_yaw(double yaw, geometry_msgs__msg__Quaternion *quaternion)
     quaternion->w = c_yaw;
 }
 
-
 //processes the distance travelled into odometry feedback to ROS:
-void odom_calc_send(const rclc_support_t *support){
+void odomtf_calc_send(const rclc_support_t *support){
 
     static double prev_left_wheel_distance;
     static double prev_right_wheel_distance;
@@ -437,7 +438,8 @@ void odom_calc_send(const rclc_support_t *support){
     float right_wheel_distance = right_wheel_rotations * 2.0 * M_PI * wheel_radius;
 
     // calculate how long it's been since the last run (in seconds):
-    float delta_time = (time_us_64() - last_odom_calc) * 1e-9;
+    float delta_time = (time_us_64() - last_odom_calc) / 1000000; //delta is in seconds, convert micros to whole seconds
+
 
     double delta_left_wheel_distance = left_wheel_distance - prev_left_wheel_distance;
     double delta_right_wheel_distance = right_wheel_distance - prev_right_wheel_distance;
@@ -484,12 +486,39 @@ void odom_calc_send(const rclc_support_t *support){
 
     // Publish the odometry message
     rcl_publish(&odom, &odom_msg, NULL);
+
+    ///////////////////////////////////////////////////////////////////////////////////
+    //now the same for the tf message:
+
+    geometry_msgs__msg__TransformStamped transform_stamped;
+
+    // Set the header of the TransformStamped message
+    transform_stamped.header.stamp.sec = (int32_t) (curr_time_us / 1000000);
+    transform_stamped.header.stamp.nanosec = (uint32_t) ((curr_time_us % 1000000) * 1000);
+    transform_stamped.header.frame_id.data = (char *) "odom";
+    transform_stamped.header.frame_id.size = strlen(transform_stamped.header.frame_id.data);
+    transform_stamped.header.frame_id.capacity = strlen(transform_stamped.header.frame_id.data) + 1;
+
+    // Set the child_frame_id of the TransformStamped message
+    transform_stamped.child_frame_id.data = (char *) "base_link";
+    transform_stamped.child_frame_id.size = strlen(transform_stamped.child_frame_id.data);
+    transform_stamped.child_frame_id.capacity = strlen(transform_stamped.child_frame_id.data) + 1;
+
+    // Set the translation and rotation (quaternion) of the TransformStamped message
+    transform_stamped.transform.translation.x = robot_x;
+    transform_stamped.transform.translation.y = robot_y;
+    transform_stamped.transform.translation.z = 0.0;
+    quaternion_from_yaw(robot_theta, &transform_stamped.transform.rotation);
+
+    // Publish the TransformStamped message
+    rcl_publish(&tf_pub, &transform_stamped, NULL);
+
 }
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time){
     //timer callback bits (for publishing outwards to ROS2)
     //odometry feedback:;
-    odom_calc_send(&support);
+    odomtf_calc_send(&support);
 }
 
 void flasher(){
@@ -583,6 +612,14 @@ int main() {
             "odom_raw"
             );
 
+    //create our publisher to /tf
+    rclc_publisher_init_default(
+            &tf_pub,
+            &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TransformStamped),
+            "tf"
+            );
+
     // create timer,
     rcl_timer_t timer = rcl_get_zero_initialized_timer();
     const unsigned int timer_timeout = 100;
@@ -594,7 +631,7 @@ int main() {
     rclc_executor_init(&executor, &support.context, 2, &allocator);
 
     //timer elements for executor to publish data:
-    unsigned int rcl_wait_timeout = 1000;   // in ms
+    unsigned int rcl_wait_timeout = 20;   // in ms
     rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(rcl_wait_timeout));
     rclc_executor_add_timer(&executor, &timer);
 
