@@ -48,11 +48,11 @@ const uint LED_PIN = 25;
 #define MS_TO_NS(ms) ((ms) * 1000000ULL)
 
 // WHEELS AND ENCODERS:
-const uint encoder_resolution = 500; //ticks per revolution (check)
-volatile int32_t left_encoder_count = 0; //for storing current count
-volatile int32_t right_encoder_count = 0; //for storing current count
-const float wheel_radius = 0.025; //25mm
-const float wheel_base_distance = 0.35; //350mm spacing
+const uint encoder_resolution = 500; //ticks per revolution of ground measuring wheel (if on wheel shaft: encoder)
+volatile int32_t left_encoder_count = 0; //for storing current count (updated in ISR)
+volatile int32_t right_encoder_count = 0; //for storing current count (updated in ISR)
+const float wheel_radius = 0.020; //20mm radius (40mm diameter)
+const float wheel_base_distance = 1.555; //1555mm spacing between wheels
 
 //PID closed loop speed control:
 float prev_left_error = 0;
@@ -277,8 +277,8 @@ void motor_speed_control(){
         if ((time_us_64() - last_motor_send) > motor_send_space) {
 
             // Define PID controller gains
-            const float Kp = 20.0;
-            const float Ki = 0.0;
+            const float Kp = 150.0;
+            const float Ki = 1.0;
             const float Kd = 5.0;
 
             float left_wheel_velocity = 0.0f;
@@ -286,7 +286,7 @@ void motor_speed_control(){
             read_encoders_and_compute_wheel_velocities(&left_wheel_velocity, &right_wheel_velocity);
 
             //time for use in PID:
-            float elapsed_time = (time_us_64() - last_pid_run) / 1000; //convert back to ms from microseconds
+            float elapsed_time = (time_us_64() - last_pid_run) / 1000000.0f; //convert back to seconds from microseconds
 
             // Compute the error between the target velocity and the current velocity
             float left_error = target_left_wheel_velocity - left_wheel_velocity;
