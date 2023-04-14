@@ -11,6 +11,7 @@ MESSY MESSY MESSY (fast flow messy code here on in)
 (some reused code from the micro-ros for pico example)
 
 TODO:
+- re-enable the cutoff when /cmd_vel hasn't been published to in a short while (in place, but disabled for testing)
 - add parameter changing of PID controls for closed loop speed control via ros2 param subscription/callback
 - storage of PID params in flash with logic to only write after params have been changed (to not burn it out)
 - add to params ability to change encoder direction, wheel diameter, wheel width, encoder points per rotation
